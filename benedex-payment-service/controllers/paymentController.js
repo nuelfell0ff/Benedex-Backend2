@@ -2,7 +2,27 @@ import axios from "axios";
 import crypto from "crypto";
 import Payment from "../models/Payment.js";
 
-const cleanUrl = (url) => (url ? url.replace(/\/+$/, "") : "");
+// Helper to strip trailing slashes and redundant api/courses suffix
+const normalizeCourseUrl = (url) => {
+  if (!url) return "";
+  let cleaned = url.replace(/\/+$/, "");
+  if (cleaned.endsWith("/api/courses")) {
+    cleaned = cleaned.replace(/\/api\/courses$/, "");
+  } else if (cleaned.endsWith("/api")) {
+    cleaned = cleaned.replace(/\/api$/, "");
+  }
+  return cleaned;
+};
+
+// Safe student population wrapper (prevents crash if User model/DB is separated)
+const safelyPopulateStudent = (query) => {
+  try {
+    return query.populate("student", "fullName email");
+  } catch (err) {
+    console.warn("⚠️ Cross-service notice: Student local population skipped:", err.message);
+    return query;
+  }
+};
 
 // Helper function to handle enrollment via Course Service over HTTP
 const processSuccessfulEnrollment = async (payment, authHeader) => {
@@ -11,11 +31,11 @@ const processSuccessfulEnrollment = async (payment, authHeader) => {
   payment.status = "success";
   await payment.save();
 
-  const courseUrl = cleanUrl(process.env.COURSE_SERVICE_URL);
-  if (courseUrl) {
+  const baseUrl = normalizeCourseUrl(process.env.COURSE_SERVICE_URL);
+  if (baseUrl) {
     try {
       await axios.post(
-        `${courseUrl}/api/courses/${payment.course}/enroll`,
+        `${baseUrl}/api/courses/${payment.course}/enroll`,
         { studentId: payment.student },
         { headers: { Authorization: authHeader } }
       );
@@ -23,6 +43,35 @@ const processSuccessfulEnrollment = async (payment, authHeader) => {
       console.error("⚠️ Failed to trigger auto-enrollment in Course Service:", err.response?.data || err.message);
     }
   }
+};
+
+// Helper function to fetch course catalog and map IDs to titles
+const fetchAndMapCourses = async (courseIds, authHeader) => {
+  const courseMap = {};
+  const baseUrl = normalizeCourseUrl(process.env.COURSE_SERVICE_URL);
+
+  if (!baseUrl || courseIds.length === 0) return courseMap;
+
+  try {
+    const courseResponse = await axios.get(`${baseUrl}/api/courses`, {
+      headers: { Authorization: authHeader }
+    });
+
+    const resData = courseResponse.data;
+    const courses = Array.isArray(resData)
+      ? resData
+      : resData?.courses || resData?.data || [];
+
+    courses.forEach((c) => {
+      if (c && c._id) {
+        courseMap[c._id.toString()] = { _id: c._id, title: c.title || "Untitled Course" };
+      }
+    });
+  } catch (err) {
+    console.error("⚠️ Failed to fetch course metadata from Course Service:", err.response?.data || err.message);
+  }
+
+  return courseMap;
 };
 
 // 1️⃣ INITIALIZE PAYMENT
@@ -38,7 +87,6 @@ export const initializePayment = async (req, res) => {
 
     const { courseId, callbackUrl, email } = req.body;
 
-    // Multi-level fallback to ensure a valid email string reaches Paystack
     const userEmail = req.user?.email || email || req.body.userEmail;
     const userId = req.user?._id || req.user?.id || req.body.userId;
     const authHeader = req.headers.authorization;
@@ -54,16 +102,16 @@ export const initializePayment = async (req, res) => {
       return res.status(400).json({ success: false, message: "Valid Course ID is required" });
     }
 
-    const courseUrl = cleanUrl(process.env.COURSE_SERVICE_URL);
-    if (!courseUrl) {
+    const baseUrl = normalizeCourseUrl(process.env.COURSE_SERVICE_URL);
+    if (!baseUrl) {
       return res.status(503).json({ success: false, message: "Course Service URL not configured." });
     }
 
-    const courseResponse = await axios.get(`${courseUrl}/api/courses/${courseId}`, {
+    const courseResponse = await axios.get(`${baseUrl}/api/courses/${courseId}`, {
       headers: { Authorization: authHeader }
     });
 
-    const course = courseResponse.data;
+    const course = courseResponse.data?.course || courseResponse.data;
     if (!course) {
       return res.status(404).json({ success: false, message: "Course not found" });
     }
@@ -90,7 +138,7 @@ export const initializePayment = async (req, res) => {
         callback_url: finalCallbackUrl,
         metadata: {
           studentId: userId ? userId.toString() : "",
-          courseId: course._id.toString(),
+          courseId: (course._id || courseId).toString(),
           paymentType: "course_enrollment"
         }
       },
@@ -104,7 +152,7 @@ export const initializePayment = async (req, res) => {
 
     await Payment.create({
       student: userId,
-      course: course._id,
+      course: course._id || courseId,
       amount: course.price,
       reference,
       status: "pending"
@@ -146,7 +194,7 @@ export const verifyPayment = async (req, res) => {
       return res.status(404).json({ success: false, message: "Payment record not found." });
     }
 
-    if (userId && payment.student.toString() !== userId.toString()) {
+    if (userId && payment.student && payment.student.toString() !== userId.toString()) {
       return res.status(403).json({ success: false, message: "Unauthorized access to this payment." });
     }
 
@@ -226,11 +274,23 @@ export const handlePaystackWebhook = async (req, res) => {
 // 4️⃣ ADMIN: GET ALL PAYMENTS
 export const getAllPaymentsForAdmin = async (req, res) => {
   try {
-    const payments = await Payment.find({})
-      .populate("student", "fullName email")
-      .sort({ createdAt: -1 });
+    let query = Payment.find({}).sort({ createdAt: -1 }).lean();
+    query = safelyPopulateStudent(query);
 
-    return res.json({ success: true, count: payments.length, payments });
+    const payments = await query;
+
+    const courseIds = [...new Set(payments.map((p) => p.course).filter(Boolean))];
+    const courseMap = await fetchAndMapCourses(courseIds, req.headers.authorization);
+
+    const enrichedPayments = payments.map((payment) => {
+      const courseIdStr = payment.course?.toString();
+      return {
+        ...payment,
+        course: courseMap[courseIdStr] || { _id: payment.course, title: "Purged Syllabus Node" }
+      };
+    });
+
+    return res.json({ success: true, count: enrichedPayments.length, payments: enrichedPayments });
   } catch (error) {
     console.error("Admin payments fetch failure:", error.message);
     return res.status(500).json({ message: "Failed to retrieve transactions" });
@@ -247,15 +307,26 @@ export const getPaymentTelemetry = async (req, res) => {
 
     const totalRevenue = revenueResult.length > 0 ? revenueResult[0].total : 0;
 
-    const recentPayments = await Payment.find({})
-      .populate("student", "fullName email")
-      .sort({ createdAt: -1 })
-      .limit(5);
+    let query = Payment.find({}).sort({ createdAt: -1 }).limit(5).lean();
+    query = safelyPopulateStudent(query);
+
+    const recentPayments = await query;
+
+    const courseIds = [...new Set(recentPayments.map((p) => p.course).filter(Boolean))];
+    const courseMap = await fetchAndMapCourses(courseIds, req.headers.authorization);
+
+    const enrichedRecent = recentPayments.map((payment) => {
+      const courseIdStr = payment.course?.toString();
+      return {
+        ...payment,
+        course: courseMap[courseIdStr] || { _id: payment.course, title: "Purged Syllabus Node" }
+      };
+    });
 
     return res.json({
       success: true,
       totalRevenue,
-      recentPayments
+      recentPayments: enrichedRecent
     });
   } catch (error) {
     console.error("Telemetry fetch error:", error.message);
@@ -277,11 +348,23 @@ export const logAuditActivity = async (req, res) => {
 // 7️⃣ ADMIN: GET SUPPORT/PAYMENT TICKETS
 export const getPaymentTickets = async (req, res) => {
   try {
-    const pendingTickets = await Payment.find({ status: "pending" })
-      .populate("student", "fullName email")
-      .sort({ createdAt: -1 });
+    let query = Payment.find({ status: "pending" }).sort({ createdAt: -1 }).lean();
+    query = safelyPopulateStudent(query);
 
-    return res.json(pendingTickets);
+    const pendingTickets = await query;
+
+    const courseIds = [...new Set(pendingTickets.map((p) => p.course).filter(Boolean))];
+    const courseMap = await fetchAndMapCourses(courseIds, req.headers.authorization);
+
+    const enrichedTickets = pendingTickets.map((ticket) => {
+      const courseIdStr = ticket.course?.toString();
+      return {
+        ...ticket,
+        course: courseMap[courseIdStr] || { _id: ticket.course, title: "Purged Syllabus Node" }
+      };
+    });
+
+    return res.json(enrichedTickets);
   } catch (error) {
     console.error("Get tickets error:", error.message);
     return res.status(500).json({ message: error.message });
