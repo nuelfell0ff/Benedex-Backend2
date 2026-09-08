@@ -1,19 +1,38 @@
-import ActivityLog from '../../benedex-auth-service/models/ActivityLog.js';
+import axios from "axios";
 
-// 1. Direct utility function for explicitly logging complex manual edits (like creations/deletions)
+// Helper to strip trailing slashes
+const normalizeAuthUrl = (url) => {
+  if (!url) return "";
+  return url.replace(/\/+$/, "");
+};
+
+// 1. Direct utility function for explicitly logging complex manual edits via HTTP
 export const logAdminActivity = async (req, moduleName, actionType, detailsString) => {
   try {
-    await ActivityLog.create({
-      admin: req.user._id,
-      adminName: req.user.name || req.user.email,
-      module: moduleName,
-      actionType: actionType,
-      details: detailsString,
-      ipAddress: req.ip || req.headers['x-forwarded-for'],
-      device: req.headers['user-agent']
-    });
+    const authUrl = normalizeAuthUrl(process.env.AUTH_SERVICE_URL);
+    if (!authUrl) return;
+
+    const authHeader = req.headers?.authorization;
+
+    // Dispatch audit log payload to benedex-auth-service asynchronously
+    await axios.post(
+      `${authUrl}/api/audit-log`,
+      {
+        module: moduleName,
+        actionType: actionType,
+        details: detailsString,
+        ipAddress: req.ip || req.headers?.["x-forwarded-for"],
+        device: req.headers?.["user-agent"]
+      },
+      {
+        headers: {
+          Authorization: authHeader,
+          "Content-Type": "application/json"
+        }
+      }
+    );
   } catch (err) {
-    console.error("Audit logging execution engine background error:", err);
+    console.error("Audit logging execution engine background error:", err.response?.data || err.message);
   }
 };
 
@@ -22,10 +41,10 @@ export const trackPageView = (moduleName) => {
   return async (req, res, next) => {
     // Only log if user is authenticated via your protect middleware
     if (req.user) {
-      await logAdminActivity(
+      logAdminActivity(
         req,
         moduleName,
-        'VIEW',
+        "VIEW",
         `Accessed and viewed the ${moduleName.toLowerCase()} interface page panel.`
       );
     }
