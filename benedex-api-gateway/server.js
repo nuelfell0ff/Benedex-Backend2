@@ -15,9 +15,19 @@ const cache = apicache.middleware;
 app.use(helmet());
 app.use(morgan("dev"));
 
-// ⚡ Optimized CORS Setup with 24-Hour Preflight Cache
+// Helper to sanitize base targets (removes trailing slashes and /api suffix)
+const cleanTargetUrl = (url, fallback) => {
+  const target = url || fallback;
+  return target.replace(/\/+$/, "").replace(/\/api$/, "");
+};
+
+const AUTH_TARGET = cleanTargetUrl(process.env.AUTH_SERVICE_URL, "http://127.0.0.1:5001");
+const COURSE_TARGET = cleanTargetUrl(process.env.COURSE_SERVICE_URL, "http://127.0.0.1:5002");
+const PAYMENT_TARGET = cleanTargetUrl(process.env.PAYMENT_SERVICE_URL, "http://127.0.0.1:5003");
+
+// CORS Configuration
 const corsOptions = {
-  origin: process.env.CLIENT_URL || "http://localhost:5173",
+  origin: process.env.CLIENT_URL || "http://localhost:5173" || "https://benedex.org",
   credentials: true,
   methods: ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
   allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With"],
@@ -37,11 +47,6 @@ app.get("/health", (req, res) => {
   res.status(200).json({ status: "OK", message: "Benedex API Gateway running healthy 🚀" });
 });
 
-// Service Target Endpoints
-const AUTH_TARGET = process.env.AUTH_SERVICE_URL || "http://127.0.0.1:5001";
-const COURSE_TARGET = process.env.COURSE_SERVICE_URL || "http://127.0.0.1:5002";
-const PAYMENT_TARGET = process.env.PAYMENT_SERVICE_URL || "http://127.0.0.1:5003";
-
 // Cache condition helper
 const only200 = (req, res) => res.statusCode === 200;
 
@@ -53,13 +58,6 @@ app.use(
   })
 );
 
-// app.use(
-//   "/api/notifications",
-//   cache("5 seconds", only200, {
-//     appendKey: (req) => req.headers.authorization || "",
-//   })
-// );
-
 app.use(
   ["/api/lessons/progress", "/api/live-classes/student"],
   cache("15 seconds", only200, {
@@ -69,7 +67,7 @@ app.use(
 
 // Route Map
 const serviceRoutes = [
-  // Auth Service (Port 5001)
+  // Auth Service
   { prefix: "/api/auth", target: AUTH_TARGET },
   { prefix: "/api/admin", target: AUTH_TARGET },
   { prefix: "/api/users", target: AUTH_TARGET },
@@ -83,7 +81,7 @@ const serviceRoutes = [
   { prefix: "/api/settings", target: AUTH_TARGET },
   { prefix: "/api/student", target: AUTH_TARGET },
 
-  // Course Service (Port 5002)
+  // Course Service
   { prefix: "/api/courses", target: COURSE_TARGET },
   { prefix: "/api/modules", target: COURSE_TARGET },
   { prefix: "/api/lessons", target: COURSE_TARGET },
@@ -94,7 +92,7 @@ const serviceRoutes = [
   { prefix: "/api/instructor", target: COURSE_TARGET },
   { prefix: "/api/rewards", target: COURSE_TARGET },
 
-  // Payment Service (Port 5003)
+  // Payment Service
   { prefix: "/api/payments", target: PAYMENT_TARGET },
 ];
 
@@ -105,8 +103,8 @@ serviceRoutes.forEach(({ prefix, target }) => {
     createProxyMiddleware({
       target,
       changeOrigin: true,
-      // CRITICAL: Express strips `prefix` when calling app.use(prefix, ...).
-      // This pathRewrite restores the original path so the downstream service receives /api/...
+      proxyTimeout: 30000, // 30s timeout to survive cold boots
+      timeout: 30000,
       pathRewrite: (path, req) => req.originalUrl,
       on: {
         proxyReq: (proxyReq, req) => {
@@ -123,10 +121,11 @@ serviceRoutes.forEach(({ prefix, target }) => {
           );
         },
         error: (err, req, res) => {
-          console.error(`❌ [GATEWAY ERROR] Failed routing to ${target}:`, err.message);
+          console.error(`❌ [GATEWAY ERROR] Connection to ${target} failed:`, err.message);
           if (!res.headersSent) {
-            res.status(503).json({
-              message: "Service temporarily unavailable. Please try again shortly.",
+            res.status(504).json({
+              message: "Target microservice starting up or unreachable. Retrying...",
+              error: err.message,
             });
           }
         },
